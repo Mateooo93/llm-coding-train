@@ -1,0 +1,37 @@
+# ── Environment files containing secrets ──────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Hugging Face caches (may be large) ─────────────────────────
+data/raw/
+data/processed/
+*.cache/
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.egg/
+
+# ── Model checkpoints ───────────────────────────────────────
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# ── IDE / OS ─────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+
+# ── Colab / Jupyter working dirs ─────────────────────────────
+/content/                       # Colab ephemeral working dir
+.ipynb_checkpoints/             # Jupyter autosave checkpoints
+
+# ── Large ML artifacts (don't commit) ───────────────────────
+*.h5
+*.onnx
+wandb/                          # local Weights & Biases sync folder
