@@ -1,0 +1,77 @@
+# AttnRes LM — Dataset configuration.
+#
+# This file defines the Hugging Face datasets we'll pull for each training phase.
+# Edit this file to change the data mix (e.g., add a new instruction source)
+# without touching Python code.
+#
+# Each dataset entry supports:
+#   id:          (required) Hugging Face dataset identifier
+#   name:        (optional) human-readable label
+#   config:      (optional) subset / config name (e.g., "sample-10BT")
+#   split:       (required) "train", "test", "train_prefs", etc.
+#   streaming:   (optional, default false) stream the dataset rather than download
+#   text_field:  (optional) column to extract text from (defaults to "text")
+#
+# Filter for SWE-bench / HumanEval contamination is applied separately in the
+# pipeline; see scripts/prepare_data.py and the README for details.
+
+# ── Phase 1: Pre-training (~10-50B tokens for prototype) ──────────
+# Mix of high-quality web text + code + educational content.
+# Streaming is enabled because these are too large to materialize fully.
+pretrain:
+  - id: HuggingFaceFW/fineweb-edu
+    name: FineWeb-Edu sample-10BT
+    config: sample-10BT
+    split: train
+    streaming: true
+    text_field: text
+  - id: bigcode/starcoderdata
+    name: StarCoder (Python subset)
+    config: python
+    split: train
+    streaming: true
+    text_field: content
+  - id: HuggingFaceTB/cosmopedia
+    name: Cosmopedia stories
+    config: stories
+    split: train
+    streaming: true
+    text_field: text
+
+# ── Phase 2: Mid-training / instruction-tuning (~1-5B tokens) ──────
+# Full downloads — small enough to fit in cloud VM RAM. Include explicit
+# agent / tool-use data so ReAct scaffolds are well-represented.
+midtrain:
+  - id: teknium/OpenHermes-2.5
+    name: OpenHermes-2.5 (1M instructions)
+    split: train
+    streaming: false
+  - id: NousResearch/hermes-function-calling-v1
+    name: Hermes Function-Calling v1
+    split: train
+    streaming: false
+
+# ── Phase 3: DPO preference data ──────────────────────────────────
+# (prompt, chosen, rejected) triplets intended for ``DPOTrainer``.
+dpo:
+  - id: HuggingFaceH4/ultrafeedback_binarized
+    name: ultrafeedback_binarized
+    split: train_prefs
+    streaming: false
+  - id: m-a-p/OpenCodeInterpreter-Preference
+    name: OpenCodeInterpreter-Preference (code DPO)
+    split: train
+    streaming: false
+
+# ── Phase 4: Evaluation benchmarks ────────────────────────────────
+# These are NOT used for training; only for measuring model performance
+# against Terminal-Bench / SWE-bench style tasks.
+eval:
+  - id: openai_humaneval
+    name: HumanEval (164 code tasks)
+    split: test
+    streaming: false
+  - id: princeton-nlp/SWE-bench_Lite
+    name: SWE-bench Lite (300 tasks)
+    split: test
+    streaming: false

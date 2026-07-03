@@ -1,0 +1,55 @@
+# AttnRes LM — Small Prototype (~150M parameters)
+#
+# Designed for single-GPU training (T4 16GB / Colab / Kaggle)
+# Use this to validate that AttnRes works before scaling up.
+
+model:
+  vocab_size: 50304
+  hidden_size: 768
+  intermediate_size: 2048
+  num_hidden_layers: 12
+  num_attention_heads: 12
+  num_key_value_heads: 4
+  head_dim: 64
+  rope_theta: 10000.0
+  max_position_embeddings: 1024
+
+  # AttnRes configuration
+  use_attn_res: true
+  attn_res_block_size: 4        # 2 sublayers per block → 6 blocks total
+  attn_res_init_scale: 0.02
+
+  # Normalization
+  rms_norm_eps: 1.0e-6
+
+  # Embedding
+  tie_word_embeddings: true
+
+  # MoE (disabled for prototype)
+  use_moe: false
+
+training:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 100
+  max_steps: 5000
+  lr_scheduler_type: cosine
+
+  batch_size: 4
+  gradient_accumulation_steps: 4    # effective batch = 16
+
+  use_amp: true
+  amp_dtype: bf16
+
+  log_interval: 10
+  eval_interval: 500
+  save_interval: 1000
+  output_dir: ./checkpoints/small
+
+  use_wandb: false
+  wandb_project: attnres-lm-small
+
+# Expected parameter count: ~150M
+# Expected VRAM (bf16, grad checkpointing): ~4-6GB
+# Expected training time (T4, 5K steps): ~2-4 hours

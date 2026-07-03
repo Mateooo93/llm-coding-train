@@ -1,0 +1,125 @@
+# Base model registry — single source of truth for which open-weight base we use.
+#
+# Edit this file to swap bases; every downstream loader (LM Studio inspector,
+# Modal trainer, OpenAI-compatible client) reads from here.
+#
+# Format per entry:
+#   alias:                — short identifier used in CODE (don't rename casually)
+#   hf_id:                — Hugging Face repo (None for GGUF-only local models)
+#   gguf_repo:            — HF repo containing the GGUF quantisation (for LM Studio)
+#   licence:              — short licence name (mit / apache-2.0 / etc.)
+#   fine_tune_for_student — bool, fine-tunable + redistributable for student use?
+#   params_b:             — approximate parameter count (billions)
+#   context_window:       — default context window (tokens)
+#   4bit_vram_gb:         — approximate VRAM at 4-bit quantisation
+#   bf16_vram_gb:         — approximate VRAM at bf16 (training)
+#   recommended_sampling:
+#     temperature:        — default sampling temperature
+#     top_p:              — default nucleus sampling
+#     top_k:              — default top-k sampling
+#   reasoning_model:      — bool, emits  reasoning...  blocks before final answer
+#   tool_call_format:     — "literal_kwargs" | "openai_json" | "openhands_json"
+#   default_tool_names:   — list of tool names the model is trained to emit (only the LM-side names)
+#   benchmarks:           — dict of {benchmark_name: score} (verified published numbers)
+#   modal_a10g_cost_per_hr_usd:   — current $/hr on Modal A10G
+#   modal_a100_40gb_cost_per_hr_usd:  — current $/hr on Modal A100-40GB
+#   notes:                — one-line gotcha / why-this-pick
+
+default_base: ornith-1.0-9b
+
+models:
+
+  # ── PRIMARY PICK ────────────────────────────────────────────────
+  # MIT, agentic-coding specialist, beats Qwen3.5-9B on every coding metric
+  # AND beats Qwen3.5-35B on Terminal-Bench 2.1.
+  - alias: ornith-1.0-9b
+    hf_id: deepreinforce-ai/Ornith-1.0-9B
+    gguf_repo: deepreinforce-ai/Ornith-1.0-9B-GGUF
+    licence: mit
+    fine_tune_for_student: true
+    params_b: 9
+    context_window: 131072
+    4bit_vram_gb: 5.5
+    bf16_vram_gb: 18
+    recommended_sampling:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+    reasoning_model: true
+    tool_call_format: openhands_json   # OpenAI-style JSON inside  tool_call ... tool_call
+    default_tool_names:
+      - bash
+      - file_editor
+      - finish
+    benchmarks:
+      terminal_bench_2_1_terminus2: 43.1
+      terminal_bench_2_1_claude_code: 40.6
+      swe_bench_verified: 69.4
+      swe_bench_pro: 42.9
+      swe_bench_multilingual: 52.0
+      nl2repo: 27.2
+      claw_eval_avg: 63.1
+    modal_a10g_cost_per_hr_usd: 1.10
+    modal_a100_40gb_cost_per_hr_usd: 2.10
+    notes: |
+      Reasoning model — strip  reasoning...  blocks from final string but keep
+      in history for debugging. Tool calls are JSON inside  tool_call.
+      Must use the modified Qwen chat template (see HF model card).
+
+  # ── FALLBACK #1: code specialist, Apache 2.0 ────────────────────
+  - alias: qwen2.5-coder-14b-instruct
+    hf_id: Qwen/Qwen2.5-Coder-14B-Instruct
+    gguf_repo: Qwen/Qwen2.5-Coder-14B-Instruct-GGUF
+    licence: apache-2.0
+    fine_tune_for_student: true
+    params_b: 14.7
+    context_window: 128000
+    4bit_vram_gb: 10
+    bf16_vram_gb: 30
+    recommended_sampling:
+      temperature: 0.7
+      top_p: 0.8
+      top_k: 20
+    reasoning_model: false
+    tool_call_format: openai_json
+    default_tool_names:
+      - bash
+      - str_replace_editor
+      - finish
+    benchmarks:
+      humaneval: ~88
+      swe_bench_verified: ~58
+    modal_a10g_cost_per_hr_usd: 1.10
+    modal_a100_40gb_cost_per_hr_usd: 2.10
+    notes: |
+      Strong, well-documented coding model. Use when Ornith availability is questionable.
+
+  # ── FALLBACK #2: SWE specialist from Mistral × All Hands AI ────
+  - alias: devstral-small-2505
+    hf_id: mistralai/Devstral-Small-2505
+    gguf_repo: unsloth/Devstral-Small-2505-GGUF
+    licence: apache-2.0
+    fine_tune_for_student: true
+    params_b: 24
+    context_window: 128000
+    4bit_vram_gb: 13
+    bf16_vram_gb: 48
+    recommended_sampling:
+      temperature: 0.7
+      top_p: 0.95
+      top_k: 40
+    reasoning_model: false
+    tool_call_format: openhands_json
+    default_tool_names:
+      - bash
+      - file_editor
+      - finish
+    benchmarks:
+      swe_bench_verified: 46.8   # with OpenHands scaffold (its training scaffold)
+      opensource_sota_at_release: true
+    modal_a10g_cost_per_hr_usd: 1.10   # tight — 4-bit + adapters = ~22 GB
+    modal_a100_40gb_cost_per_hr_usd: 2.10  # comfortable
+    notes: |
+      Built by All Hands AI (OpenHands maintainers). Shares the exact OpenHands
+      tool schema as Ornith. Bigger (24B) → eats more of your $50 budget but
+      a safer pickup if Ornith proves unstable.

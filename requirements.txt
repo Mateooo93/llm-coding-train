@@ -1,0 +1,17 @@
+# Core deep learning
+torch>=2.1.0
+tiktoken>=0.5.0
+
+# HuggingFace ecosystem
+transformers>=4.36.0
+datasets>=2.14.0
+tokenizers>=0.15.0
+accelerate>=0.25.0
+
+# Training utilities
+wandb>=0.16.0
+tqdm>=4.66.0
+PyYAML>=6.0
+
+# Data processing
+numpy>=1.24.0
