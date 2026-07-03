@@ -119,10 +119,20 @@ class Trainer:
         # Per-step loss history for the notebook's loss-curve cell. Each entry
         # is {"step": int, "loss": float, "lr": float, "tokens_per_sec": float}.
         # Only rank-0 writes the final losses.json sidecar (in save_checkpoint
-        # + at the bottom of train()).
-        self.loss_history: List[Dict[str, float]] = []
+        # + at the bottom of train()).        self.loss_history: List[Dict[str, float]] = []
 
+    def _inner_model(self) -> "AttnResLM":
+        """Return the underlying AttnResLM, unwrapping DistributedDataParallel.
 
+        DDP only proxies `forward`, `parameters`, `named_parameters`, `train`,
+        `eval`, `to`, etc. — every AttnResLM-specific attribute (num_parameters,
+        save_pretrained, the model's own `config` dataclass, etc.) needs to be
+        read on `self.model.module`. Centralising the unwrap here keeps callers
+        one-liner clean.
+        """
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            return self.model.module
+        return self.model
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         """Build AdamW optimizer with separate weight decay groups."""
@@ -179,7 +189,7 @@ class Trainer:
         print(f"Starting training: {self.config.max_steps} steps, "
               f"effective batch size = {self.config.batch_size * accum_steps}")
         print(f"Device: {self.device}, AMP: {self.use_amp} ({self.config.amp_dtype})")
-        print(f"Model parameters: {self.model.num_parameters() / 1e6:.1f}M")
+        print(f"Model parameters: {self._inner_model().num_parameters() / 1e6:.1f}M")
 
         for step in range(self.config.max_steps):
             # ── Forward + Backward with gradient accumulation ────
@@ -359,13 +369,12 @@ class Trainer:
             else self.model
         )
 
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        path = os.path.join(self.config.output_dir, name)
         # Surface silent overwrites of `final` or `best` so the user is
         # aware when a re-run clobbers a previously saved checkpoint.
         if os.path.isdir(path):
             print(f"  NOTE: overwriting existing checkpoint at {path}")
-
-        os.makedirs(self.config.output_dir, exist_ok=True)
-        path = os.path.join(self.config.output_dir, name)
         os.makedirs(path, exist_ok=True)
 
         # Save model (now guaranteed to be a bare AttnResLM with save_pretrained)
