@@ -220,22 +220,28 @@ class BlockAttnRes(nn.Module):
             alpha = softmax(logits, dim=0)              # attention weights over blocks
             h = einsum('nbt, nbtd -> btd', alpha, V)    # weighted aggregation
         """
+        # Always stack every available representation and let softmax produce the
+        # weights. The previous code early-returned `partial_block` when
+        # `block_reps == []` (i.e. the very first sublayer of layer 0), which
+        # algebraically short-circuited self.proj.weight and self.norm.weight —
+        # leaving them off the autograd graph entirely. Under DDP that surfaces
+        # as `RuntimeError: Expected to have finished reduction ...` with
+        # `Parameter indices which did not receive grad: 10 11 12 13` (= the
+        # attn_res/m lp_res proj+norm params of layer 0). The single-element
+        # softmax produces alpha=1.0 so the output is mathematically identical
+        # to the early-return path, but every parameter now participates in the
+        # graph and gets a gradient.
+        if partial_block is None and len(block_reps) == 0:
+            raise RuntimeError(
+                "BlockAttnRes has no block_reps and partial_block is None — "
+                "the first sublayer must have an initial hidden state."
+            )
+
         if partial_block is None:
-            # Start of a new block with no partial accumulation yet.
-            # Attend only over completed block representations.
-            if len(block_reps) == 0:
-                raise RuntimeError(
-                    "BlockAttnRes has no block_reps and partial_block is None — "
-                    "the first sublayer must have an initial hidden state."
-                )
-            V = torch.stack(block_reps, dim=0)  # [N, B, T, D]
-        elif len(block_reps) == 0:
-            # No preceding blocks — just return the partial block as-is
-            return partial_block
+            all_reps = list(block_reps)
         else:
-            # Stack all representations: [N+1, B, T, D]
-            all_reps = block_reps + [partial_block]
-            V = torch.stack(all_reps, dim=0)
+            all_reps = list(block_reps) + [partial_block]
+        V = torch.stack(all_reps, dim=0)  # [N+1, B, T, D] or [N, B, T, D] if partial is None
 
         # Normalize for stable attention scores
         K = self.norm(V)  # [N(+1), B, T, D]

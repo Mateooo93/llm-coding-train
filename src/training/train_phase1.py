@@ -155,7 +155,20 @@ def _init_distributed(rank: int, world_size: int) -> Optional[torch.nn.parallel.
 
 
 def _maybe_wrap_ddp(model: torch.nn.Module, rank: int, world_size: int):
-    """Wrap model in DDP if running in a multi-GPU context."""
+    """Wrap model in DDP if running in a multi-GPU context.
+
+    Uses `find_unused_parameters=True` as defense-in-depth against future
+    variations that introduce conditional param usage (MoE with routing
+    that sometimes skips an expert, gradient checkpointing on a subset
+    of layers, mixed-attention hybrid patterns, etc.). The marginal
+    overhead is small for this 12-layer / 114M-param prototype and the
+    forward-compatibility win is worth it. The previously hard crash
+    (params 10-13 with grad=0 due to BlockAttnRes early-return on layer
+    0) was the proximate trigger; the underlying root-cause fix lives
+    in src/model/attn_res.py (BlockAttnRes.forward now always stacks
+    every available representation so all params participate in the
+    autograd graph).
+    """
     if world_size == 1 or not torch.distributed.is_initialized():
         return model
     if torch.cuda.is_available():
@@ -164,7 +177,7 @@ def _maybe_wrap_ddp(model: torch.nn.Module, rank: int, world_size: int):
         model,
         device_ids=[rank] if torch.cuda.is_available() else None,
         output_device=rank if torch.cuda.is_available() else None,
-        find_unused_parameters=False,
+        find_unused_parameters=True,
     )
 
 
