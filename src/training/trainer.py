@@ -115,11 +115,12 @@ class Trainer:
 
         # State
         self.global_step = 0
-        self.best_eval_loss = float("inf")
-        # Per-step loss history for the notebook's loss-curve cell. Each entry
+        self.best_eval_loss = float("inf")        # Per-step loss history for the notebook's loss-curve cell. Each entry
         # is {"step": int, "loss": float, "lr": float, "tokens_per_sec": float}.
         # Only rank-0 writes the final losses.json sidecar (in save_checkpoint
-        # + at the bottom of train()).        self.loss_history: List[Dict[str, float]] = []
+        # + at the bottom of train()).
+        self.loss_history: List[Dict[str, float]] = []
+
 
     def _inner_model(self) -> "AttnResLM":
         """Return the underlying AttnResLM, unwrapping DistributedDataParallel.
@@ -257,11 +258,15 @@ class Trainer:
                 )
                 lr = self.scheduler.get_last_lr()[0]
 
+                aux_str = (
+                    f" Aux: {step_aux_loss / (self.config.log_interval * accum_steps):.4f}"
+                    if step_aux_loss > 0 else ""
+                )
                 print(
                     f"Step {self.global_step:>6}/{self.config.max_steps} | "
                     f"Loss: {avg_loss:.4f}"
-                    + (f" Aux: {step_aux_loss / (self.config.log_interval * accum_steps):.4f}" if step_aux_loss > 0 else "")
-                    + " | LR: {lr:.2e} | " 
+                    f"{aux_str}"
+                    f" | LR: {lr:.2e} | "
                     f"Tokens/s: {tokens_per_sec:.0f} | "
                     f"Time: {elapsed:.1f}s"
                 )
