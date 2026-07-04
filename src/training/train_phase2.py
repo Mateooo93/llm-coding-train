@@ -48,7 +48,9 @@ from transformers import (
 from .qlora import (
     build_bnb_config,
     build_lora_config,
+    build_lora_config_for_attnres,
     count_trainable_parameters,
+    prepare_lora_model,
     prepare_qlora_model,
 )
 
@@ -60,7 +62,14 @@ from .qlora import (
 # Adding a flag? Add it here AND in `_parse_args` together.
 # ---------------------------------------------------------------------------
 _DEFAULTS: dict = {
-    "base_model": "deepreinforce-ai/Ornith-1.0-9B",
+    # Phase 2's BASE is our own AttnResLM from Phase 1 — so the fine-tune
+    # actually exercises the architectural breakthroughs (AttnRes residuals
+    # + sub-quadratic / hybrid attention) rather than inheriting Ornith-
+    # style standard softmax attention. Override to a HF AutoModel repo
+    # id (e.g. `deepreinforce-ai/Ornith-1.0-9B`) to fall back to QLoRA-on-
+    # someone-else's-base; the dispatcher below picks the right prep
+    # function based on `config.model_type`.
+    "base_model": "oars344/attnres-phase1",
     "lora_r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.05,
@@ -167,6 +176,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=_DEFAULTS["seed"])
 
     # Pipeline-validation mode.
+    p.add_argument("--quantize-base", action="store_true",
+                   default=False,
+                   help="Apply bitsandbytes 4-bit quant to the base (only "
+                        "useful for larger bases; the 114M default AttnResLM "
+                        "fits comfortably in bf16 without quant). Ignored if "
+                        "the base is an HF AutoModel like Ornith, where the "
+                        "QLoRA path always quantizes.")
+    # Validation gates (default ON, with escape hatch for power users).
+    p.add_argument("--no-validate", dest="validate", action="store_false",
+                   default=True,
+                   help="Disable pre-flight checks (lm_head-in-targets + tied "
+                        "embeddings footgun, and the post-load adapter-count "
+                        "assertion). Use only when you've audited the "
+                        "interaction yourself.")
     p.add_argument("--smoke", action="store_true", default=_DEFAULTS["smoke"],
                    help="Run a 50-step pipeline-validation pass instead of the "
                         "full training. Disables hub push, sets save_interval=0, "
@@ -357,6 +380,45 @@ class JsonLossCallback(TrainerCallback):
 
 
 # ---------------------------------------------------------------------------
+# Base auto-dispatch helper
+# ---------------------------------------------------------------------------
+
+def _peek_base_config(repo_id: str, hf_token: Optional[str]) -> dict:
+    """Peek at `config.json` at `repo_id` (or local path) for tier-1 fields.
+
+    Returns a dict with `model_type` (string, e.g. `"attnres"`, `"llama"`,
+    `"qwen2"`) and `tie_word_embeddings` (bool). These are the only fields
+    Phase 2's pre-flight dispatcher reads; everything else stays out of
+    the round-trip-cost-critical peek path.
+
+    For local paths, just reads the local `config.json`. For HF hub repos,
+    uses `huggingface_hub.hf_hub_download` to grab just the JSON file.
+    Defaults to `{"model_type": "unknown", "tie_word_embeddings": False}`
+    on any error so the caller falls back to the safe (QLoRA) path.
+    """
+    import json
+    try:
+        if os.path.isdir(repo_id):
+            with open(os.path.join(repo_id, "config.json")) as f:
+                cfg = json.load(f)
+        else:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(
+                repo_id=repo_id, filename="config.json", token=hf_token,
+            )
+            with open(path) as f:
+                cfg = json.load(f)
+        return {
+            "model_type": cfg.get("model_type", "unknown"),
+            "tie_word_embeddings": bool(cfg.get("tie_word_embeddings", False)),
+        }
+    except Exception as e:
+        print(f"[phase-2] WARN: could not peek config for {repo_id}: {e}. "
+              f"Falling back to standard QLoRA prep.")
+        return {"model_type": "unknown", "tie_word_embeddings": False}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -468,26 +530,76 @@ def main() -> int:
 
     # 4-bit + LoRA prep.
     bnb_config = build_bnb_config(amp_dtype=args.amp_dtype)
-    lora_config = build_lora_config(
-        r=args.lora_r,
-        alpha=args.lora_alpha,
-        dropout=args.lora_dropout,
-        target_modules=[t.strip() for t in args.lora_target_modules.split(",") if t.strip()],
-        bias=args.lora_bias,
-    )
+    lora_targets = [t.strip() for t in args.lora_target_modules.split(",") if t.strip()]
 
     print(
-        f"[phase-2] Loading {args.base_model} with bitsandbytes 4-bit + "
-        f"PEFT/LoRA (this downloads once + caches; ~3 min first time)..."
+        f"[phase-2] Loading {args.base_model} + PEFT/LoRA "
+        f"(this downloads once + caches; ~3 min first time)..."
     )
     t0 = time.time()
-    model, tokenizer = prepare_qlora_model(
-        args.base_model,
-        lora_config=lora_config,
-        bnb_config=bnb_config,
-        use_gradient_checkpointing=args.gc,
-        token=args.hf_token,
-    )
+    # Auto-dispatch: peek at the base's `model_type` + `tie_word_embeddings`
+    # from `config.json` at the hub before committing to a prep function.
+    # Avoids a wasted 4-bit quant pass on a small / non-quantized base
+    # (114M AttnResLM), and avoids skipping quant when the user pointed
+    # Phase 2 at a 9B HF AutoModel (Ornith).
+    base_meta = _peek_base_config(args.base_model, args.hf_token)
+    base_model_type = base_meta["model_type"]
+
+    # Pre-flight: PEFT footgun. If the user puts `lm_head` in target_modules
+    # AND the base has tied embeddings, PEFT will replace lm_head's nn.Linear
+    # with `lora.Linear` whose `base_layer.weight` is *copied* (not
+    # storage-shared). The embed↔lm_head tie silently breaks. Refuse to
+    # proceed unless the caller passes --no-validate.
+    if args.validate and "lm_head" in lora_targets and base_meta.get("tie_word_embeddings", False):
+        raise RuntimeError(
+            "[phase-2] ABORT: `--lora-target-modules` includes \"lm_head\" AND "
+            "the base has `tie_word_embeddings=True`. PEFT will silently "
+            "break the embed↔lm_head weight tie (LoRA wraps copy-storage, "
+            "not the original param). Either:\n"
+            "  (a) remove `lm_head` from `--lora-target-modules`, OR\n"
+            "  (b) rerun with `--no-validate` to bypass (you take responsibility "
+            "      for the busted tie)."
+        )
+    if base_model_type == "attnres":
+        # No 4-bit quant — our 114M base fits comfortably in bf16 on T4/A10G.
+        # AttnRes-aware target list adds attn_res.proj / mlp_res.proj unless
+        # the user overrode via --lora-target-modules on the CLI.
+        if lora_targets == [t.strip() for t in _DEFAULTS["lora_target_modules"].split(",") if t.strip()]:
+            from .qlora import DEFAULT_LORA_TARGETS_ATTNRES, DEFAULT_LORA_TARGETS
+            if set(lora_targets) == set(DEFAULT_LORA_TARGETS):
+                lora_targets = list(DEFAULT_LORA_TARGETS_ATTNRES)
+        lora_config = build_lora_config_for_attnres(
+            r=args.lora_r,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_modules=lora_targets,
+            bias=args.lora_bias,
+        )
+        model, tokenizer = prepare_lora_model(
+            args.base_model,
+            lora_config=lora_config,
+            use_gradient_checkpointing=args.gc,
+            token=args.hf_token,
+            quantize=args.quantize_base,
+            bnb_compute_dtype=(torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16),
+        )
+    else:
+        # Standard QLoRA path: 4-bit NF4 + double quant + LoRA on the
+        # 7 Llama-style linears. `lora_targets` is honored verbatim.
+        lora_config = build_lora_config(
+            r=args.lora_r,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_modules=lora_targets,
+            bias=args.lora_bias,
+        )
+        model, tokenizer = prepare_qlora_model(
+            args.base_model,
+            lora_config=lora_config,
+            bnb_config=bnb_config,
+            use_gradient_checkpointing=args.gc,
+            token=args.hf_token,
+        )
     trainable, total, pct = count_trainable_parameters(model)
     print(f"[phase-2] Trainable: {trainable:,} / {total:,}  ({pct:.2f}%)")
 

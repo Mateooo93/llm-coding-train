@@ -204,6 +204,16 @@ def _push_to_hub(model, output_dir: str, repo_id: str, hf_token: Optional[str], 
     """Upload the final checkpoint directory to HuggingFace Hub.
 
     Requires `huggingface_hub` (already in requirements.txt).
+
+    Phase 1 saves the model + tokenizer into `output_dir/final/`
+    (`_save_final` writes everything into that subdir so the rest of
+    `output_dir/` can stay clean — losses.json, intermediate checkpoints
+    if any). For Phase 2's
+    `AutoModelForCausalLM.from_pretrained(repo)` to find `config.json`
+    + `pytorch_model.bin` directly at the repo root, we upload
+    `output_dir/final/` *as the repo root* — not `output_dir/`. The
+    README model card is written inside `final/README.md` so it lands
+    at the repo root after the upload.
     """
     from huggingface_hub import HfApi, create_repo
 
@@ -216,14 +226,25 @@ def _push_to_hub(model, output_dir: str, repo_id: str, hf_token: Optional[str], 
     # user can flip with --public later.
     create_repo(repo_id, token=hf_token, exist_ok=True, private=False, repo_type="model")
 
-    # Write a small model card so the repo is self-describing
-    readme_path = os.path.join(output_dir, "README.md")
+    final_path = os.path.join(output_dir, "final")
+
+    # Write a small model card so the repo is self-describing. Place it
+    # INSIDE `final/` so it lifts to the repo root after we upload that
+    # subdir as the root.
+    readme_path = os.path.join(final_path, "README.md")
     with open(readme_path, "w") as f:
         f.write(_model_card(repo_id, model, model_config))
 
-    # Upload the whole folder
+    # Verification step — log every file we'll push, so a "missing
+    # tokenizer" or "missing config.json" surfaces immediately instead
+    # of as a confusing from_pretrained crash hours later in Phase 2.
+    files = sorted(os.listdir(final_path))
+    print(f"[rank-0] Pushing {len(files)} files to {repo_id}: {files}")
+
+    # Upload the `final/` subdir *as the repo root* so Phase 2's
+    # `from_pretrained(repo)` finds config.json + model weights at root.
     api.upload_folder(
-        folder_path=output_dir,
+        folder_path=final_path,
         repo_id=repo_id,
         commit_message="Phase 1 training complete",
         token=hf_token,
@@ -273,13 +294,92 @@ model = AttnResLM.from_pretrained(".")
 
 
 def _save_final(model, output_dir: str, rank: int, world_size: int) -> None:
-    """Save final model + config to <output_dir>/final/ (rank 0 on DDP)."""
+    """Save final model + config + tokenizer to <output_dir>/final/ (rank 0 on DDP).
+
+    The tokenizer save is the key bridge to Phase 2: Phase 1's training
+    uses `tiktoken` directly (BPE from GPT-2's released merges),
+    mathematically identical to HF's `GPT2TokenizerFast`. Saving the HF
+    tokenizer alongside the model means Phase 2's
+    `AutoTokenizer.from_pretrained("oars344/attnres-phase1")` works
+    without us writing a tiktoken→HF shim. The 47-row gap between
+    AttnResLM's `vocab_size=50304` and the tokenizer's 50257 is fine:
+    embedding rows 50257–50303 are never indexed and stay at their
+    init-weight values.
+    """
     if world_size > 1 and torch.distributed.get_rank() != 0:
         return
     final_path = os.path.join(output_dir, "final")
     inner = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     inner.save_pretrained(final_path)
-    print(f"[rank-{rank}] Saved final model to {final_path}")
+    # Step 1: re-write config.json in HF-compatible AttnResLMConfigHF schema,
+    # so Phase 2's `AutoModelForCausalLM.from_pretrained()` can deserialize.
+    # Robust against future dataclass-only fields.
+    _save_hf_compatible_config(final_path, inner.config)
+    # Step 2: save a HF-compatible tokenizer next to the model so Phase 2's
+    # `AutoTokenizer.from_pretrained()` works without a tiktoken shim.
+    _save_hf_compatible_tokenizer(final_path)
+    print(f"[rank-{rank}] Saved final model + tokenizer to {final_path}")
+
+
+def _save_hf_compatible_config(final_path: str, attnres_config) -> None:
+    """Overwrite config.json with the HF-compatible `AttnResLMConfigHF` schema.
+
+    `AttnResLM.save_pretrained()` writes config.json in the dataclass
+    schema (via `dataclasses.asdict`). For Phase 2's
+    `AutoModelForCausalLM.from_pretrained()` to deserialize via the
+    `AttnResLMConfigHF` PretrainedConfig, we rewrite config.json with
+    the HF schema. Today's dataclass and HF schemas happen to share
+    keys, but the HF schema version is the canonical source of truth
+    and any future dataclass-only field stays cleanly separated.
+    """
+    try:
+        from dataclasses import asdict
+        from src.model.hf_wrapper import AttnResLMConfigHF
+        hf_config = AttnResLMConfigHF(**asdict(attnres_config))
+        with open(os.path.join(final_path, "config.json"), "w") as f:
+            json.dump(hf_config.to_dict(), f, indent=2)
+    except Exception as e:
+        print(f"[WARN] Failed to write HF-compatible config.json: {e}. "
+              f"Phase 2 may fail to deserialize via from_pretrained() unless fixed.")
+
+
+def _save_hf_compatible_tokenizer(final_path: str) -> None:
+    """Save a HuggingFace `GPT2TokenizerFast` to `final_path`.
+
+    Tiktoken's `gpt2` encoding has the SAME byte-level BPE vocab + merges
+    as HF's `gpt2` tokenizer. We instantiate the HF tokenizer from disk
+    (no size difference in vocab: 50257 either way) and save it next to
+    the model so Phase 2's standard HF tooling can load both.
+
+    We also pin `model_max_length` to whatever the just-saved
+    `AttnResConfig.max_position_embeddings` was — without this, HF
+    defaults `model_max_length=1024` and Phase 2's data collator can
+    silently truncate sequences at 1024 even if `args.seq_len=2048`.
+    """
+    try:
+        from transformers import GPT2TokenizerFast
+        tok = GPT2TokenizerFast.from_pretrained("gpt2")
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        # Pin model_max_length to the model's actual context — read from
+        # the just-saved config.json (HF schema written above).
+        cfg_path = os.path.join(final_path, "config.json")
+        max_len = 1024
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path) as f:
+                    max_len = json.load(f).get("max_position_embeddings", 1024)
+            except Exception:
+                pass
+        tok.model_max_length = max_len
+        tok.save_pretrained(final_path)
+    except Exception as e:
+        # Don't fail the save if the tokenizer write fails — Phase 1
+        # already finished training and we don't want a typo in a
+        # this-side helper to wipe the checkpoint. Print loud warning
+        # so the user knows to investigate.
+        print(f"[WARN] Failed to save HF tokenizer to {final_path}: {e}. "
+              f"Phase 2 will need local tiktoken shim unless this is fixed.")
 
 
 def main() -> int:

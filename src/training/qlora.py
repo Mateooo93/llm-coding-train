@@ -16,11 +16,24 @@ model-construction choreography:
      silently trains nothing** — a variant of the same loss-of-gradient
      failure mode we debugged in Phase 1's BlockAttnRes early-return bug.
 
-Designed around `deepreinforce-ai/Ornith-1.0-9B` (Llama-architecture 9B
-reasoning / agentic-coding model — see `config/base_models.yaml`) but the
-helpers work on any HF AutoModelForCausalLM with a Llama- or Qwen-style
-attention / MLP module layout. Override `--lora-target-modules` from the
-CLI for fused-QKV or non-Llama architectures.
+Designed to support TWO base kinds:
+
+  1) **HF AutoModelForCausalLM bases** (e.g. `deepreinforce-ai/Ornith-1.0-9B`) —
+     full QLoRA path: bitsandbytes 4-bit NF4 + double-quant + bf16 compute
+     + PEFT LoRA adapters via `prepare_qlora_model()` below.
+
+  2) **Our own AttnResLM base** (loaded via the HF wrapper registered in
+     `src/model/hf_wrapper.py`) — bitsandbytes is unnecessary at the 114M
+     scale, so we skip 4-bit and just attach PEFT LoRA adapters via
+     `prepare_lora_model()`. At larger scales (~1B+), QLoRA's 4-bit memory
+     savings become valuable; switch to `prepare_qlora_model()` with a
+     `medium_1b()` / `target_9b()` AttnResLM base.
+
+Override `--lora-target-modules` from the CLI for fused-QKV or non-Llama
+architectures. For AttnResLM bases we also recommend wrapping
+`attn_res.proj` and `mlp_res.proj` — the BlockAttnRes pseudo-query
+projections — so adapters can re-route the residual stream for the
+downstream task. See `DEFAULT_LORA_TARGETS_ATTNRES` below.
 """
 from __future__ import annotations
 
@@ -32,12 +45,26 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 
-# Default LoRA target modules for Llama- / Qwen-style transformer blocks. These
-# are the seven linear projections in each block and match the QLoRA paper's
-# recommended configuration for coding / reasoning tasks.
+# Default LoRA target modules for Llama- / Qwen-style transformer blocks (the
+# QLoRA paper recipe). Used as the default for HF AutoModel bases.
 DEFAULT_LORA_TARGETS: List[str] = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
+]
+
+# AttnRes-aware defaults: the 7 standard linears PLUS the two BlockAttnRes
+# pseudo-query projections per block. Adapting `attn_res.proj` /
+# `mlp_res.proj` lets the LoRA adapter specialize the residual-stream
+# aggregation for the downstream task — architecturally on-theme rather
+# than treating our innovations as no-op layers during fine-tuning. The
+# two added `proj` modules are `nn.Linear(hidden, 1)`; with r=16 they
+# add barely any adapter capacity but unlock task-specific residual
+# routing. PEFT pattern-matches by module NAME (`attn_res.proj` sits at
+# `layers.N.attn_res.proj`), so no architecture-side support is needed
+# beyond having the names match.
+DEFAULT_LORA_TARGETS_ATTNRES: List[str] = DEFAULT_LORA_TARGETS + [
+    "attn_res.proj",
+    "mlp_res.proj",
 ]
 
 
@@ -111,6 +138,27 @@ def build_lora_config(
         target_modules=target_modules,
         bias=bias,
         task_type="CAUSAL_LM",
+    )
+
+
+def build_lora_config_for_attnres(
+    r: int = 16,
+    alpha: int = 32,
+    dropout: float = 0.05,
+    target_modules: Optional[List[str]] = None,
+    bias: str = "none",
+) -> LoraConfig:
+    """Same as `build_lora_config` but defaults to AttnRes-aware targets.
+
+    Adds `attn_res.proj` and `mlp_res.proj` to the standard 7-linears set
+    so PEFT adapters can re-task the BlockAttnRes pseudo-query
+    projections. See `DEFAULT_LORA_TARGETS_ATTNRES` for the rationale.
+    """
+    if target_modules is None:
+        target_modules = list(DEFAULT_LORA_TARGETS_ATTNRES)
+    return build_lora_config(
+        r=r, alpha=alpha, dropout=dropout,
+        target_modules=target_modules, bias=bias,
     )
 
 
@@ -200,6 +248,104 @@ def prepare_qlora_model(
         # (Symptom: loss stays constant at the random-init value, or
         #  loss decreases for the first ~5 steps then freezes — both
         #  point to this.)
+        model.enable_input_require_grads()
+
+    return model, tokenizer
+
+
+def prepare_lora_model(
+    base_model_id: str,
+    lora_config: LoraConfig,
+    *,
+    use_gradient_checkpointing: bool = True,
+    cache_dir: Optional[str] = None,
+    token: Optional[str] = None,
+    trust_remote_code: bool = False,
+    quantize: bool = False,
+    bnb_compute_dtype: Optional[torch.dtype] = None,
+) -> Tuple:
+    """Load a base model (HF AutoModel OR AttnResLM) + wrap in LoRA adapters.
+
+    Difference from `prepare_qlora_model()`: this function does NOT
+    automatically apply bitsandbytes 4-bit. For our 114M AttnResLM base,
+    full BF16 + LoRA is the right choice (4-bit overhead exceeds savings
+    on tiny models). For larger bases (~1B+), set `quantize=True` with
+    a `bnb_compute_dtype` and the function paths through the same
+    4-bit + PEFT prep dance as `prepare_qlora_model()` — but using
+    whatever the caller's `LoraConfig` (`build_lora_config` /
+    `build_lora_config_for_attnres`) produced, so AttnRes-aware
+    `target_modules` work transparently.
+
+    Auto-routing:
+      - Per `model_type` in the loaded config, HF dispatches to the
+        right class (Llama → `LlamaForCausalLM`, `attnres` →
+        `AttnResLMForCausalLM`).
+      - Our `AttnResLMForCausalLM` is registered at import time in
+        `src/model/hf_wrapper.py`, so no `trust_remote_code=True` is
+        needed when the consumer's Python process has imported our
+        code (which `train_phase2.py` does at the top of its main()).
+
+    Returns:
+        (model, tokenizer) ready for `transformers.Trainer`.
+    """
+    hf_token = (
+        token
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+    )
+
+    if quantize:
+        from peft import prepare_model_for_kbit_training
+        if bnb_compute_dtype is None:
+            bnb_compute_dtype = torch.bfloat16
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=bnb_compute_dtype,
+        )
+        # Load + 4-bit prep.
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            quantization_config=bnb_config,
+            cache_dir=cache_dir,
+            token=hf_token,
+            trust_remote_code=trust_remote_code,
+        )
+        base_model.config.use_cache = False
+        base_model = prepare_model_for_kbit_training(
+            base_model, use_gradient_checkpointing=use_gradient_checkpointing
+        )
+    else:
+        # Full-precision (bf16) load — our 114M base fits comfortably
+        # on a 16GB T4 in bf16. For larger bases, prefer `quantize=True`.
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+            token=hf_token,
+            trust_remote_code=trust_remote_code,
+        )
+        base_model.config.use_cache = False
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_id,
+        cache_dir=cache_dir,
+        token=hf_token,
+        trust_remote_code=trust_remote_code,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = get_peft_model(base_model, lora_config)
+
+    if use_gradient_checkpointing:
+        # Same CRITICAL shim as in prepare_qlora_model: ensures the
+        # embedding layer stays on the autograd graph under gradient
+        # checkpointing so PEFT adapters receive gradient signal. For
+        # a non-quantized base (quantize=False) the embed_tokens are
+        # NOT frozen, so adapters actually NEED the upstream chain to
+        # be intact — skipping this line produces a silently-noop run.
         model.enable_input_require_grads()
 
     return model, tokenizer

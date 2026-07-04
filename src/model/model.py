@@ -28,6 +28,12 @@ from .config import AttnResConfig
 from .attn_res import RMSNorm, ResidualState
 from .transformer_block import AttnResTransformerBlock
 
+# Importing the HF wrapper registers `AttnresLMConfigHF` /
+# `AttnResLMForCausalLM` with `transformers.AutoConfig` so HF can route
+# `from_pretrained()` calls without `trust_remote_code=True`. The wrapper
+# is a thin adaptor — `AttnResLM` stays the canonical class.
+from . import hf_wrapper  # noqa: F401
+
 
 @dataclass
 class AttnResOutput:
