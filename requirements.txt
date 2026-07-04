@@ -15,3 +15,11 @@ PyYAML>=6.0
 
 # Data processing
 numpy>=1.24.0
+
+# Phase 2 — QLoRA fine-tuning (deepreinforce-ai/Ornith-1.0-9B + adapters)
+peft>=0.7.0
+bitsandbytes>=0.41.0
+scipy>=1.10.0
+
+# Optional: TRL's SFTTrainer for downstream SFT work (Phase 2.5+)
+trl>=0.7.0

@@ -1,0 +1,56 @@
+# Phase 2 — QLoRA fine-tune of Ornith-1.0-9B
+#
+# Run from a Colab / Modal cell once Peppe Phase 1 finishes:
+#     !python -m src.training.train_phase2 \
+#         --config config/phase2_qlora.yaml \
+#         --push-to-hub --repo-id oars344/ornith-9b-attnres
+#
+# Cost target:
+#   * ~$0 on Colab T4 — tight (batch=1, seq=1024, GC=on works but slow).
+#   * ~$5 on Modal A10G — comfortable memory headroom.
+# See config/base_models.yaml for current $/hr on each Modal GPU tier.
+
+model:
+  base_model: deepreinforce-ai/Ornith-1.0-9B
+  amp_dtype: bf16                                      # bf16 for A10G/A100; T4 → fp16
+  use_gradient_checkpointing: true                     # required for 9B + 4-bit on 24GB
+
+lora:
+  r: 16                                                # adapter rank (←8 light / 32 high / 64 max)
+  alpha: 32                                            # convention: alpha ≈ 2×r
+  dropout: 0.05
+  target_modules:                                      # Llama-style 7 linears; override for Phi / fused-QKV
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: none                                           # none is the QLoRA paper default
+
+training:
+  learning_rate: 2.0e-4                                # QLoRA paper recommends 2e-4 for adapters
+  weight_decay: 0.0
+  warmup_steps: 50
+  max_steps: 2000
+  lr_scheduler_type: cosine
+
+  batch_size: 1                                        # A10G-safe for 9B + 4-bit + adapters
+  gradient_accumulation_steps: 16                      # effective batch = 16 (= 8×2 with no DDP)
+
+  save_interval: 1000                                  # save adapter ckpt every 1000 steps
+  log_interval: 10
+  output_dir: ./outputs/ornith-qlora
+
+  push_to_hub: false                                   # flip to true + set repo-id when ready
+  repo_id: null                                        # e.g. oars344/ornish-9b-attnres
+
+dataset:
+  name: HuggingFaceFW/fineweb-edu
+  config: sample-10BT
+  split: train
+  max_sequences: 4096                                  # cap on streamed FineWeb sequences
+  seq_len: 1024                                        # context window for next-token loss
+
+seed: 42
