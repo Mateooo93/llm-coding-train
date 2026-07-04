@@ -51,10 +51,12 @@ import torch
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    CausalLMOutputWithPast,
     PretrainedConfig,
     PreTrainedModel,
 )
+# transformers 5.x removed the top-level re-export of CausalLMOutputWithPast;
+# pull it directly from the modeling_outputs submodule (still works in 4.x too).
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 # Default AttnRes config dict (mirrors `src.model.config.AttnResConfig()` defaults).
@@ -242,6 +244,35 @@ class AttnResLMForCausalLM(PreTrainedModel):
 
     def gradient_checkpointing_disable(self):
         self.model.gradient_checkpointing_disable()
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values=None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> dict:
+        """HF expected method that PEFT probes at __init__ time (peft_model.py:1956).
+
+        We don't yet implement KV-cache, so for past_key_values pop the last
+        token (mirroring HF Llama's behavior when cache is on) and otherwise
+        just pass through what's needed by the forward path. This is the
+        minimum that lets `peft.get_peft_model` complete its base-model probe
+        — actual generation quality is gated on us implementing past_key_values
+        in CausalLMOutputWithPast later. For the Phase 2 training loop we only
+        need this method to exist; we never call it for forward+backward.
+        """
+        if past_key_values is not None:
+            # last-token slice only when continuing from a cached prompt
+            input_ids = input_ids[:, -1:]
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "use_cache": False,
+            **kwargs,
+        }
 
     def save_pretrained(self, save_directory, **kwargs):
         """Save the underlying AttnResLM, then write the HF config.json.
